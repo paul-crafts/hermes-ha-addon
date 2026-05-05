@@ -55,9 +55,14 @@ NODE_DIR="$HOME/.npm-global"
 GO_DIR="$HOME/.go"
 CERTS_DIR="$HOME/.certs"
 INGRESS_PORT=49169
+# Default-profile ports (profile index 0)
+# Named profiles get TTYD/dashboard offset by PORT_BLOCK per profile index.
+# Gateway API port is offset by 10 per profile index (stays compact).
+PORT_BLOCK=1000
 TTYD_HERMES_PORT=49269
 TTYD_TERMINAL_PORT=49369
 DASHBOARD_PORT=49469
+GATEWAY_API_PORT=8642
 HTTP_PORT=8080
 HTTPS_PORT=8443
 
@@ -509,13 +514,32 @@ else
     echo "[run] TLS certificates: using existing"
 fi
 
-# ── Section 9: Render nginx config ───────────────────────────────────
+# ── Section 9: Profile Discovery & Nginx Render ───────────────────────
 # Check dashboard availability (used for nginx stripping + landing page)
 DASHBOARD_AVAILABLE="false"
 if python -c "from hermes_cli.web_server import start_server" 2>/dev/null; then
     DASHBOARD_AVAILABLE="true"
 fi
 
+# Discover all profiles (including default)
+PROFILES_DATA=$(python -c '
+import json, os
+from hermes_cli.profiles import list_profiles
+profiles = list_profiles()
+out = []
+for p in profiles:
+    out.append({"name": p.name, "label": p.name, "path": str(p.path)})
+print(json.dumps(out))
+')
+PROFILES_COUNT=$(echo "$PROFILES_DATA" | jq '. | length')
+
+echo "[run] Discovered $PROFILES_COUNT profiles"
+
+# Prepare dynamic nginx config snippets
+PROFILE_UPSTREAMS=""
+PROFILE_LOCATIONS=""
+
+# Define auth basic vars
 if [ -n "$ACCESS_PASSWORD" ]; then
     AUTH_BASIC_ON='auth_basic "Hermes Agent"; auth_basic_user_file /etc/nginx/.htpasswd;'
     AUTH_BASIC_OFF='auth_basic off;'
@@ -524,7 +548,80 @@ else
     AUTH_BASIC_OFF=''
 fi
 
-# Render ports config if any direct-port service enabled
+# We will fill these as we start services
+declare -A PROFILE_DASHBOARD_TOKENS
+
+# Generate nginx config for named profiles
+# Profile index 0 is always "default"
+for i in $(seq 1 $((PROFILES_COUNT - 1))); do
+    P_NAME=$(echo "$PROFILES_DATA" | jq -r ".[$i].name")
+    
+    # Port allocation
+    P_TTYD_HERMES=$((TTYD_HERMES_PORT + i * PORT_BLOCK))
+    P_TTYD_TERMINAL=$((TTYD_TERMINAL_PORT + i * PORT_BLOCK))
+    P_DASHBOARD=$((DASHBOARD_PORT + i * PORT_BLOCK))
+    P_API=$((GATEWAY_API_PORT + i * 10))
+
+    # Upstreams
+    PROFILE_UPSTREAMS+="
+    upstream ttyd_hermes_${P_NAME} { server 127.0.0.1:${P_TTYD_HERMES}; }
+    upstream ttyd_terminal_${P_NAME} { server 127.0.0.1:${P_TTYD_TERMINAL}; }
+    upstream hermes_api_${P_NAME} { server 127.0.0.1:${P_API}; }
+    upstream hermes_dashboard_${P_NAME} { server 127.0.0.1:${P_DASHBOARD}; }
+    "
+
+    # Locations
+    PROFILE_LOCATIONS+="
+        # Profile: ${P_NAME}
+        location = /profiles/${P_NAME}/hermes { return 302 /profiles/${P_NAME}/hermes/; }
+        location /profiles/${P_NAME}/hermes/ {
+            proxy_pass http://ttyd_hermes_${P_NAME}/;
+            proxy_http_version 1.1;
+            proxy_set_header Upgrade \$http_upgrade;
+            proxy_set_header Connection \"upgrade\";
+            proxy_set_header Host \$host;
+            proxy_set_header X-Real-IP \$remote_addr;
+            proxy_buffering off;
+        }
+        location = /profiles/${P_NAME}/terminal { return 302 /profiles/${P_NAME}/terminal/; }
+        location /profiles/${P_NAME}/terminal/ {
+            proxy_pass http://ttyd_terminal_${P_NAME}/;
+            proxy_http_version 1.1;
+            proxy_set_header Upgrade \$http_upgrade;
+            proxy_set_header Connection \"upgrade\";
+            proxy_set_header Host \$host;
+            proxy_set_header X-Real-IP \$remote_addr;
+            proxy_buffering off;
+        }
+        location /profiles/${P_NAME}/v1/ {
+            proxy_pass http://hermes_api_${P_NAME}/v1/;
+            proxy_http_version 1.1;
+            proxy_set_header Host \$host;
+            proxy_set_header X-Real-IP \$remote_addr;
+            proxy_buffering off;
+        }
+        location = /profiles/${P_NAME}/dashboard { return 302 /profiles/${P_NAME}/dashboard/; }
+        location /profiles/${P_NAME}/dashboard/api/ {
+            proxy_pass http://hermes_dashboard_${P_NAME}/api/;
+            proxy_http_version 1.1;
+            proxy_set_header Host 127.0.0.1;
+            proxy_set_header X-Forwarded-Host \$host;
+            proxy_set_header X-Real-IP \$remote_addr;
+            proxy_set_header Authorization \"Bearer %%DASHBOARD_TOKEN_${P_NAME}%%\";
+            proxy_buffering off;
+        }
+        location /profiles/${P_NAME}/dashboard/ {
+            proxy_pass http://hermes_dashboard_${P_NAME}/;
+            proxy_http_version 1.1;
+            proxy_set_header Host 127.0.0.1;
+            proxy_set_header X-Forwarded-Host \$host;
+            proxy_set_header X-Real-IP \$remote_addr;
+            proxy_buffering off;
+        }
+    "
+done
+
+# Render nginx configs
 if [ "$ENABLE_DASHBOARD" = "true" ] || [ "$ENABLE_TERMINAL" = "true" ] || [ "$ENABLE_API" = "true" ]; then
     cp /etc/nginx/nginx-ports.conf.tpl /etc/nginx/ports.conf
     sed -i \
@@ -536,28 +633,25 @@ if [ "$ENABLE_DASHBOARD" = "true" ] || [ "$ENABLE_TERMINAL" = "true" ] || [ "$EN
         -e "s|%%CERTS_DIR%%|${CERTS_DIR}|g" \
         -e "s|%%AUTH_BASIC_ON%%|${AUTH_BASIC_ON}|g" \
         -e "s|%%AUTH_BASIC_OFF%%|${AUTH_BASIC_OFF}|g" \
-        /etc/nginx/ports.conf
+        -e "/%%PROFILE_UPSTREAMS%%/r /dev/stdin" /etc/nginx/ports.conf <<< "$PROFILE_UPSTREAMS"
+    
+    # Fix the marker replacement (sed -r is tricky, simpler to use a temp file or just replace)
+    sed -i "s|%%PROFILE_LOCATIONS%%|$(echo "$PROFILE_LOCATIONS" | sed 's/[&/|]/\\&/g')|g" /etc/nginx/ports.conf
+    sed -i "s|%%PROFILE_UPSTREAMS%%||g" /etc/nginx/ports.conf
+
     # Conditionally remove terminal/API locations
     if [ "$ENABLE_TERMINAL" != "true" ]; then
         sed -i '/# TERMINAL_START/,/# TERMINAL_END/d' /etc/nginx/ports.conf
-        echo "[run] Web terminal: disabled on direct ports"
-    else
-        echo "[run] Web terminal: enabled on direct ports"
     fi
     if [ "$ENABLE_API" != "true" ]; then
         sed -i '/# API_START/,/# API_END/d' /etc/nginx/ports.conf
     fi
     if [ "$ENABLE_DASHBOARD" != "true" ] || [ "$DASHBOARD_AVAILABLE" != "true" ]; then
         sed -i '/# DASHBOARD_START/,/# DASHBOARD_END/d' /etc/nginx/ports.conf
-        echo "[run] Web dashboard: disabled on direct ports"
-    else
-        echo "[run] Web dashboard: enabled on direct ports"
     fi
     INCLUDE_PORTS="include /etc/nginx/ports.conf;"
-    echo "[run] Direct ports: enabled (HTTP: $HTTP_PORT, HTTPS: $HTTPS_PORT)"
 else
     INCLUDE_PORTS="# direct ports disabled"
-    echo "[run] Direct ports: disabled (Ingress only)"
 fi
 
 cp /etc/nginx/nginx.conf.tpl /etc/nginx/nginx.conf
@@ -571,6 +665,10 @@ sed -i \
     -e "s|%%INCLUDE_PORTS%%|${INCLUDE_PORTS}|g" \
     /etc/nginx/nginx.conf
 
+# Inject profile markers into main nginx config
+sed -i "s|%%PROFILE_UPSTREAMS%%|$(echo "$PROFILE_UPSTREAMS" | sed 's/[&/|]/\\&/g')|g" /etc/nginx/nginx.conf
+sed -i "s|%%PROFILE_LOCATIONS%%|$(echo "$PROFILE_LOCATIONS" | sed 's/[&/|]/\\&/g')|g" /etc/nginx/nginx.conf
+
 # Strip dashboard from ingress if module not available
 if [ "$DASHBOARD_AVAILABLE" != "true" ]; then
     sed -i '/# DASHBOARD_START/,/# DASHBOARD_END/d' /etc/nginx/nginx.conf
@@ -579,14 +677,11 @@ fi
 # Render landing page
 ADDON_SLUG=$(hostname | tr '-' '_')
 SHOW_TERMINAL="false"
-if [ "$ENABLE_TERMINAL" = "true" ]; then
-    SHOW_TERMINAL="true"
-fi
+if [ "$ENABLE_TERMINAL" = "true" ]; then SHOW_TERMINAL="true"; fi
 SHOW_DASHBOARD="$DASHBOARD_AVAILABLE"
 SHOW_DASHBOARD_PORTS="false"
-if [ "$ENABLE_DASHBOARD" = "true" ] && [ "$DASHBOARD_AVAILABLE" = "true" ]; then
-    SHOW_DASHBOARD_PORTS="true"
-fi
+if [ "$ENABLE_DASHBOARD" = "true" ] && [ "$DASHBOARD_AVAILABLE" = "true" ]; then SHOW_DASHBOARD_PORTS="true"; fi
+
 cp /var/www/landing.html.tpl /var/www/landing.html
 sed -i \
     -e "s|%%HERMES_VERSION%%|${HERMES_VERSION}|g" \
@@ -594,35 +689,43 @@ sed -i \
     -e "s|%%SHOW_TERMINAL%%|${SHOW_TERMINAL}|g" \
     -e "s|%%SHOW_DASHBOARD%%|${SHOW_DASHBOARD}|g" \
     -e "s|%%SHOW_DASHBOARD_PORTS%%|${SHOW_DASHBOARD_PORTS}|g" \
+    -e "s|%%PROFILES_JSON%%|$(echo "$PROFILES_DATA" | jq -c '.' | sed 's/[&/|]/\\&/g')|g" \
     /var/www/landing.html
 
 echo "[run] Nginx configured (ingress: $INGRESS_PORT, HTTP: $HTTP_PORT, HTTPS: $HTTPS_PORT)"
 
 # ── Section 10: Start services ───────────────────────────────────────
-GATEWAY_PID=""
-TTYD_TERMINAL_PID=""
-TTYD_HERMES_PID=""
-DASHBOARD_PID=""
-DASHBOARD_TOKEN=""
+declare -A GATEWAY_PIDS
+declare -A TTYD_HERMES_PIDS
+declare -A TTYD_TERMINAL_PIDS
+declare -A DASHBOARD_PIDS
 
 start_gateway() {
-    echo "[run] Starting Hermes gateway..."
-    mkdir -p "$HERMES_HOME/logs"
-    cd "$HERMES_HOME"
-    hermes gateway run 2>&1 | tee -a "$HERMES_HOME/logs/gateway.log" &
-    TEE_PID=$!
-    sleep 0.5  # let gateway fork
-    GATEWAY_PID=$(pgrep -f "hermes gateway run" | sort -n | tail -1 || echo "$TEE_PID")
-    echo "[run] Gateway started (PID: $GATEWAY_PID, tee: $TEE_PID)"
+    local p_name="${1:-default}"
+    local p_home="${2:-$HERMES_HOME}"
+    local p_port="${3:-$GATEWAY_API_PORT}"
+    
+    echo "[run] [$p_name] Starting Hermes gateway (port: $p_port)..."
+    mkdir -p "$p_home/logs"
+    
+    # We use HERMES_CONFIG_OVERRIDE to ensure the port is correct regardless of config.yaml
+    (HERMES_HOME="$p_home" HERMES_CONFIG_OVERRIDE_api_server__port="$p_port" hermes gateway run 2>&1 | tee -a "$p_home/logs/gateway.log") &
+    local tee_pid=$!
+    sleep 1
+    local g_pid=$(pgrep -f "hermes.*gateway run" | sort -n | tail -1 || echo "$tee_pid")
+    GATEWAY_PIDS["$p_name"]="$g_pid"
+    echo "[run] [$p_name] Gateway started (PID: $g_pid)"
 }
 
-start_ttyd() {
-    echo "[run] Starting ttyd (hermes: ${TTYD_HERMES_PORT}, terminal: ${TTYD_TERMINAL_PORT})..."
-    # Hermes startup wrapper (avoids .profile autostart recursion)
-    cat > /usr/local/bin/start-hermes << 'WRAPPER'
+# Start-hermes wrapper that supports profile argument
+cat > /usr/local/bin/start-hermes << 'WRAPPER'
 #!/bin/bash
 source ~/.bashrc
-hermes
+if [ -n "$1" ]; then
+    hermes -p "$1"
+else
+    hermes
+fi
 ret=$?
 if [ $ret -eq 0 ]; then exit 0; fi
 echo ""
@@ -630,153 +733,129 @@ echo "Hermes exited with code $ret. Shell is available for debugging."
 echo "Run 'hermes' to restart, or 'exit' to close."
 exec bash
 WRAPPER
-    chmod +x /usr/local/bin/start-hermes
-    # Hermes: dedicated wrapper (sources .bashrc, starts hermes, fallback shell on error)
-    ttyd \
-        --port "${TTYD_HERMES_PORT}" \
-        --interface 127.0.0.1 \
-        --base-path /hermes/ \
-        --writable -d 3 \
-        tmux -u new -A -s hermes /usr/local/bin/start-hermes &
-    TTYD_HERMES_PID=$!
-    # Terminal: non-login shell (plain shell)
-    ttyd \
-        --port "${TTYD_TERMINAL_PORT}" \
-        --interface 127.0.0.1 \
-        --base-path /terminal/ \
-        --writable -d 3 \
-        tmux -u new -A -s terminal /usr/bin/bash &
-    TTYD_TERMINAL_PID=$!
-    echo "[run] ttyd started (hermes PID: $TTYD_HERMES_PID, terminal PID: $TTYD_TERMINAL_PID)"
+chmod +x /usr/local/bin/start-hermes
+
+start_ttyd() {
+    local p_name="${1:-default}"
+    local p_home="${2:-$HERMES_HOME}"
+    local p_hermes_port="${3:-$TTYD_HERMES_PORT}"
+    local p_terminal_port="${4:-$TTYD_TERMINAL_PORT}"
+    local p_base="/hermes/"
+    [ "$p_name" != "default" ] && p_base="/profiles/${p_name}/hermes/"
+    local t_base="/terminal/"
+    [ "$p_name" != "default" ] && t_base="/profiles/${p_name}/terminal/"
+
+    echo "[run] [$p_name] Starting ttyd (hermes: ${p_hermes_port}, terminal: ${p_terminal_port})..."
+    
+    ttyd --port "${p_hermes_port}" --interface 127.0.0.1 --base-path "$p_base" --writable -d 3 \
+        tmux -u new -A -s "hermes_${p_name}" /usr/local/bin/start-hermes "$([ "$p_name" != "default" ] && echo "$p_name")" &
+    TTYD_HERMES_PIDS["$p_name"]=$!
+    
+    ttyd --port "${p_terminal_port}" --interface 127.0.0.1 --base-path "$t_base" --writable -d 3 \
+        tmux -u new -A -s "terminal_${p_name}" /usr/bin/bash &
+    TTYD_TERMINAL_PIDS["$p_name"]=$!
 }
 
 start_dashboard() {
-    if [ "$DASHBOARD_AVAILABLE" != "true" ]; then
-        echo "[run] Dashboard: not available (web_server module not found)"
-        return
-    fi
-    echo "[run] Starting dashboard (port: $DASHBOARD_PORT)..."
-    cd "$HERMES_HOME"
-    python -c "from hermes_cli.web_server import start_server; start_server(host='127.0.0.1', port=$DASHBOARD_PORT, open_browser=False)" &
-    DASHBOARD_PID=$!
-    echo "[run] Dashboard started (PID: $DASHBOARD_PID)"
+    local p_name="${1:-default}"
+    local p_home="${2:-$HERMES_HOME}"
+    local p_port="${3:-$DASHBOARD_PORT}"
+
+    if [ "$DASHBOARD_AVAILABLE" != "true" ]; then return; fi
+    echo "[run] [$p_name] Starting dashboard (port: $p_port)..."
+    (cd "$p_home" && HERMES_HOME="$p_home" python -c "from hermes_cli.web_server import start_server; start_server(host='127.0.0.1', port=$p_port, open_browser=False)") &
+    DASHBOARD_PIDS["$p_name"]=$!
 }
 
-# Read the dashboard's ephemeral session token and inject it into nginx config.
-# The dashboard generates a random token on each start and embeds it in index.html.
-# nginx auth_basic and HA Ingress both consume/strip the Authorization header,
-# so the browser's Bearer token never reaches the dashboard backend.
-# We read the token from the dashboard's HTML and inject it via proxy_set_header.
 inject_dashboard_token() {
-    if [ "$DASHBOARD_AVAILABLE" != "true" ]; then
-        return
-    fi
-    echo "[run] Waiting for dashboard token..."
+    local p_name="${1:-default}"
+    local p_port="${2:-$DASHBOARD_PORT}"
+    if [ "$DASHBOARD_AVAILABLE" != "true" ]; then return; fi
+    
+    echo "[run] [$p_name] Waiting for dashboard token..."
     local token=""
     for i in $(seq 1 15); do
-        token=$(curl -s "http://127.0.0.1:${DASHBOARD_PORT}/" 2>/dev/null \
-            | grep -oP '__HERMES_SESSION_TOKEN__="\K[^"]+' || true)
-        if [ -n "$token" ]; then
-            break
-        fi
+        token=$(curl -s "http://127.0.0.1:${p_port}/" 2>/dev/null | grep -oP '__HERMES_SESSION_TOKEN__="\K[^"]+' || true)
+        [ -n "$token" ] && break
         sleep 2
     done
     if [ -z "$token" ]; then
-        echo "[run] Warning: could not read dashboard token (dashboard API auth may not work)"
-        # Use a placeholder so nginx config is still valid
+        echo "[run] [$p_name] Warning: could not read dashboard token"
         token="UNAVAILABLE"
     fi
-    DASHBOARD_TOKEN="$token"
-    echo "[run] Dashboard token obtained (${#token} chars)"
+    # Inject into nginx configs
+    if [ "$p_name" = "default" ]; then
+        sed -i "s|%%DASHBOARD_TOKEN%%|${token}|g" /etc/nginx/nginx.conf
+        [ -f /etc/nginx/ports.conf ] && sed -i "s|%%DASHBOARD_TOKEN%%|${token}|g" /etc/nginx/ports.conf
+    else
+        sed -i "s|%%DASHBOARD_TOKEN_${p_name}%%|${token}|g" /etc/nginx/nginx.conf
+        [ -f /etc/nginx/ports.conf ] && sed -i "s|%%DASHBOARD_TOKEN_${p_name}%%|${token}|g" /etc/nginx/ports.conf
+    fi
 }
 
-reload_nginx() {
-    echo "[run] Reloading nginx with full config..."
-    nginx -s reload
-    echo "[run] nginx reloaded"
-}
-
-# Register signal handler BEFORE starting services
+# Register signal handler
 trap shutdown SIGTERM SIGINT
 
-start_gateway
-start_ttyd
-start_dashboard
-inject_dashboard_token
+# Start all profiles
+for i in $(seq 0 $((PROFILES_COUNT - 1))); do
+    P_NAME=$(echo "$PROFILES_DATA" | jq -r ".[$i].name")
+    P_HOME=$(echo "$PROFILES_DATA" | jq -r ".[$i].path")
+    
+    # Calculate ports
+    if [ "$P_NAME" = "default" ]; then
+        P_API=$GATEWAY_API_PORT
+        P_TTYD_H=$TTYD_HERMES_PORT
+        P_TTYD_T=$TTYD_TERMINAL_PORT
+        P_DASH=$DASHBOARD_PORT
+    else
+        P_API=$((GATEWAY_API_PORT + i * 10))
+        P_TTYD_H=$((TTYD_HERMES_PORT + i * PORT_BLOCK))
+        P_TTYD_T=$((TTYD_TERMINAL_PORT + i * PORT_BLOCK))
+        P_DASH=$((DASHBOARD_PORT + i * PORT_BLOCK))
+    fi
+    
+    start_gateway "$P_NAME" "$P_HOME" "$P_API"
+    start_ttyd "$P_NAME" "$P_HOME" "$P_TTYD_H" "$P_TTYD_T"
+    start_dashboard "$P_NAME" "$P_HOME" "$P_DASH"
+    inject_dashboard_token "$P_NAME" "$P_DASH"
+done
 
-# Inject the dashboard token into the already-rendered nginx configs
-if [ -n "$DASHBOARD_TOKEN" ]; then
-    sed -i "s|%%DASHBOARD_TOKEN%%|${DASHBOARD_TOKEN}|g" /etc/nginx/nginx.conf
-    [ -f /etc/nginx/ports.conf ] && sed -i "s|%%DASHBOARD_TOKEN%%|${DASHBOARD_TOKEN}|g" /etc/nginx/ports.conf
-fi
-
-reload_nginx
-
-echo "[run] All services started"
-# Derive base URL from HASS_URL (scheme + host, our port)
-BASE_URL="${HASS_URL:-http://localhost}"
-BASE_SCHEME="${BASE_URL%%://*}"
-BASE_HOST="${BASE_URL#*://}"
-BASE_HOST="${BASE_HOST%%:*}"
-BASE_HOST="${BASE_HOST%%/*}"
-if [ "$BASE_SCHEME" = "https" ]; then
-    BASE_URL="${BASE_SCHEME}://${BASE_HOST}:${HTTPS_PORT}"
-else
-    BASE_URL="${BASE_SCHEME}://${BASE_HOST}:${HTTP_PORT}"
-fi
-echo "─────────────────────────────────────────────"
-echo " ${HERMES_VERSION}"
-echo " Gateway PID: ${GATEWAY_PID}"
-echo " Hermes:      ${BASE_URL}/hermes/"
-[ "$DASHBOARD_AVAILABLE" = "true" ] && echo " Dashboard:   ${BASE_URL}/dashboard/"
-echo " Terminal:    ${BASE_URL}/terminal/"
-echo " API:         ${BASE_URL}/v1/"
-echo "─────────────────────────────────────────────"
+nginx -s reload
+echo "[run] All services started for $PROFILES_COUNT profiles"
 
 # ── Section 11: Signal handling ──────────────────────────────────────
 shutdown() {
     echo ""
     echo "[run] Shutting down..."
-    # Reverse order: nginx -> ttyd -> gateway
     nginx -s quit 2>/dev/null || true
-    echo "[run] nginx stopped"
-    for pid in "$TTYD_TERMINAL_PID" "$TTYD_HERMES_PID" "$DASHBOARD_PID"; do
-        if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
-            kill "$pid" 2>/dev/null
-        fi
+    for p in "${!GATEWAY_PIDS[@]}"; do
+        kill "${GATEWAY_PIDS[$p]}" 2>/dev/null || true
+        kill "${TTYD_HERMES_PIDS[$p]}" 2>/dev/null || true
+        kill "${TTYD_TERMINAL_PIDS[$p]}" 2>/dev/null || true
+        kill "${DASHBOARD_PIDS[$p]}" 2>/dev/null || true
     done
-    echo "[run] ttyd + dashboard stopped"
-    if [ -n "$GATEWAY_PID" ] && kill -0 "$GATEWAY_PID" 2>/dev/null; then
-        kill -TERM "$GATEWAY_PID" 2>/dev/null
-        local waited=0
-        while kill -0 "$GATEWAY_PID" 2>/dev/null && [ $waited -lt 10 ]; do
-            sleep 1
-            waited=$((waited + 1))
-        done
-        if kill -0 "$GATEWAY_PID" 2>/dev/null; then
-            echo "[run] Gateway didn't stop gracefully, force killing..."
-            kill -9 "$GATEWAY_PID" 2>/dev/null || true
-        fi
-        echo "[run] Gateway stopped"
-    fi
     echo "[run] Shutdown complete"
     exit 0
 }
 
 # ── Section 12: Supervisor loop ──────────────────────────────────────
 while true; do
-    if ! kill -0 "$GATEWAY_PID" 2>/dev/null; then
-        set +e; wait "$GATEWAY_PID" 2>/dev/null; EXIT_CODE=$?; set -e
-        if [ $EXIT_CODE -eq 0 ]; then
-            echo "[run] Gateway exited normally (code 0) — restarting in 3s..."
-            echo "[run] (Use the shutdown handler to stop the container.)"
-        else
-            echo "[run] Gateway exited unexpectedly (code: $EXIT_CODE), restarting in 3s..."
+    for p in "${!GATEWAY_PIDS[@]}"; do
+        if ! kill -0 "${GATEWAY_PIDS[$p]}" 2>/dev/null; then
+            echo "[run] [$p] Gateway exited, restarting..."
+            # For simplicity in this script, we just restart with previous known values
+            # In a real scenario we might want to re-calculate but profiles are static here
+            P_IDX=0
+            for i in $(seq 0 $((PROFILES_COUNT - 1))); do
+                [ "$(echo "$PROFILES_DATA" | jq -r ".[$i].name")" = "$p" ] && P_IDX=$i && break
+            done
+            P_HOME=$(echo "$PROFILES_DATA" | jq -r ".[$P_IDX].path")
+            P_API=$GATEWAY_API_PORT
+            [ "$p" != "default" ] && P_API=$((GATEWAY_API_PORT + P_IDX * 10))
+            
+            start_gateway "$p" "$P_HOME" "$P_API"
         fi
-        sleep 3
-        start_gateway
-    fi
+    done
     sleep 5
 done
 
-shutdown

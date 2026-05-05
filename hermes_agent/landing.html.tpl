@@ -10,7 +10,7 @@
   body{display:flex;flex-direction:column}
   .titlebar{display:flex;align-items:center;gap:8px;padding:4px 8px;background:#1c1c1c;border-bottom:1px solid #1f2937;min-height:32px;flex-shrink:0}
   .titlebar .version{color:#ffd700;font-size:12px;white-space:nowrap}
-  .titlebar .buttons{display:flex;gap:6px;margin:0 auto}
+  .titlebar .buttons{display:flex;gap:6px;margin:0 auto;align-items:center}
   .titlebar .status{display:flex;gap:6px;font-size:11px;color:#9ca3af}
   .btn{background:#009ac7;color:white;border:0;border-radius:6px;padding:4px 10px;cursor:pointer;text-decoration:none;display:inline-block;font-size:12px}
   .btn.secondary{background:#334155}
@@ -21,6 +21,17 @@
   .term iframe{position:absolute;top:0;left:0;width:100%;height:100%;border:0;background:black}
   .term iframe.hidden{display:none}
   .term .no-services{display:none;justify-content:center;align-items:center;height:100%;color:#9ca3af;font-size:14px}
+  /* Profile selector */
+  .profile-select-wrap{display:flex;align-items:center;gap:4px;font-size:12px;color:#9ca3af}
+  .profile-select-wrap label{white-space:nowrap}
+  #profileSelect{
+    background:#242b36;color:#e6edf3;border:1px solid #374151;
+    border-radius:6px;padding:2px 6px;font-size:12px;cursor:pointer;
+    max-width:120px;
+  }
+  #profileSelect:focus{outline:none;border-color:#009ac7}
+  /* Hide profile selector when only one profile exists */
+  .profile-select-wrap.single{display:none}
 </style>
 </head>
 <body>
@@ -28,6 +39,12 @@
 <div class="titlebar">
   <span class="version">%%HERMES_VERSION%%</span>
   <div class="buttons">
+    <!-- Profile selector (hidden when there is only the default profile) -->
+    <div class="profile-select-wrap" id="profileSelectWrap">
+      <label for="profileSelect">Profile:</label>
+      <select id="profileSelect"></select>
+    </div>
+
     <button class="btn active" id="btnHermes" onclick="setMode('hermes')">Hermes</button>
     <button class="btn secondary" id="btnDashboard" onclick="setMode('dashboard')" style="display:none">Dashboard</button>
     <button class="btn secondary" id="btnTerminal" onclick="setMode('terminal')">Terminal</button>
@@ -42,20 +59,57 @@
 </div>
 
 <div class="term">
-  <iframe id="frameHermes" src="./hermes/" title="Hermes Agent"></iframe>
+  <iframe id="frameHermes" src="" title="Hermes Agent"></iframe>
   <iframe id="frameDashboard" src="" title="Dashboard" class="hidden"></iframe>
-  <iframe id="frameTerminal" src="./terminal/" title="Terminal" class="hidden"></iframe>
+  <iframe id="frameTerminal" src="" title="Terminal" class="hidden"></iframe>
   <div id="noServices" class="no-services">These services are available via the Home Assistant sidebar.</div>
 </div>
 
 <script>
 (function() {
-  var frameHermes = document.getElementById('frameHermes');
+  // ── Profile data injected by run.sh ──────────────────────────────────────
+  // Format: [{name:"default",label:"default"}, {name:"coder",label:"coder"}, ...]
+  var PROFILES = %%PROFILES_JSON%%;
+
+  // ── Resolve nginx base path for a given profile ───────────────────────────
+  // Default profile → routes at /hermes/, /terminal/, /dashboard/, /v1/
+  // Named profile → routes at /profiles/<name>/hermes/, etc.
+  function profileBase(name) {
+    if (name === 'default' || !name) return './';
+    return './profiles/' + name + '/';
+  }
+
+  // ── Profile selector setup ────────────────────────────────────────────────
+  var sel = document.getElementById('profileSelect');
+  var wrap = document.getElementById('profileSelectWrap');
+
+  PROFILES.forEach(function(p) {
+    var opt = document.createElement('option');
+    opt.value = p.name;
+    opt.textContent = p.label || p.name;
+    sel.appendChild(opt);
+  });
+
+  // Restore last-used profile from localStorage
+  var savedProfile = localStorage.getItem('hermes_profile');
+  var initialProfile = 'default';
+  if (savedProfile && PROFILES.some(function(p){ return p.name === savedProfile; })) {
+    initialProfile = savedProfile;
+    sel.value = savedProfile;
+  }
+
+  // Hide the selector when there is only one profile
+  if (PROFILES.length <= 1) {
+    wrap.classList.add('single');
+  }
+
+  // ── Mode / iframe management ──────────────────────────────────────────────
+  var frameHermes   = document.getElementById('frameHermes');
   var frameDashboard = document.getElementById('frameDashboard');
   var frameTerminal = document.getElementById('frameTerminal');
-  var btnHermes = document.getElementById('btnHermes');
-  var btnDashboard = document.getElementById('btnDashboard');
-  var btnTerminal = document.getElementById('btnTerminal');
+  var btnHermes     = document.getElementById('btnHermes');
+  var btnDashboard  = document.getElementById('btnDashboard');
+  var btnTerminal   = document.getElementById('btnTerminal');
   var current = 'hermes';
   var dashboardLoaded = false;
 
@@ -64,9 +118,48 @@
     btnDashboard.style.display = '';
   }
 
+  // Load iframe sources for a profile; reload if profile changed
+  function loadProfileSources(profileName, force) {
+    var base = profileBase(profileName);
+    var newHermes   = base + 'hermes/';
+    var newTerminal = base + 'terminal/';
+    if (force || frameHermes.src !== newHermes) {
+      frameHermes.src = newHermes;
+    }
+    if (force || frameTerminal.src !== newTerminal) {
+      frameTerminal.src = newTerminal;
+    }
+    // Dashboard is lazy-loaded; reset so it reloads next time user switches to it
+    if (force) {
+      frameDashboard.src = '';
+      dashboardLoaded = false;
+    }
+  }
+
+  // Initial load
+  loadProfileSources(initialProfile, false);
+
+  // Profile dropdown change handler
+  sel.addEventListener('change', function() {
+    var name = sel.value;
+    localStorage.setItem('hermes_profile', name);
+    // Reset to hermes mode on profile switch
+    current = 'hermes';
+    frameHermes.className = '';
+    frameDashboard.className = 'hidden';
+    frameTerminal.className = 'hidden';
+    btnHermes.className = 'btn active';
+    if (showDashboard) btnDashboard.className = 'btn secondary';
+    btnTerminal.className = 'btn secondary';
+    loadProfileSources(name, true);
+    updateStatusChecks(name);
+  });
+
   window.setMode = function(mode) {
     if (mode === current) return;
     current = mode;
+    var profileName = sel.value || 'default';
+    var base = profileBase(profileName);
     frameHermes.className = mode === 'hermes' ? '' : 'hidden';
     frameDashboard.className = mode === 'dashboard' ? '' : 'hidden';
     frameTerminal.className = mode === 'terminal' ? '' : 'hidden';
@@ -74,12 +167,12 @@
     btnDashboard.className = mode === 'dashboard' ? 'btn active' : 'btn secondary';
     btnTerminal.className = mode === 'terminal' ? 'btn active' : 'btn secondary';
     if (mode === 'dashboard' && !dashboardLoaded) {
-      frameDashboard.src = './dashboard/';
+      frameDashboard.src = base + 'dashboard/';
       dashboardLoaded = true;
     }
   };
 
-  // Detect context: iframe = HA ingress, top-level = direct port access
+  // ── Detect context: iframe = HA ingress, top-level = direct port access ───
   try { var inIframe = window !== window.top; } catch(e) { var inIframe = true; }
   if (inIframe) {
     // Ingress: always show everything
@@ -103,25 +196,33 @@
     }
   }
 
+  // ── Status checks ─────────────────────────────────────────────────────────
   var s = document.getElementById('statusSecure');
   s.textContent = window.isSecureContext ? '\u2705 Secure' : '\u26A0\uFE0F Not secure';
 
-  var g = document.getElementById('statusGateway');
-  fetch('./v1/health', {cache:'no-store'}).then(function(r) {
-    g.textContent = r.ok ? '\u2705 Gateway' : '\uD83D\uDCA4 Gateway';
-  }).catch(function() {
-    g.textContent = '\uD83D\uDCA4 Gateway';
-  });
-
-  if (showDashboard) {
-    var d = document.getElementById('statusDashboard');
-    d.style.display = '';
-    fetch('./dashboard/api/status', {cache:'no-store'}).then(function(r) {
-      d.textContent = r.ok ? '\u2705 Dashboard' : '\uD83D\uDCA4 Dashboard';
+  function updateStatusChecks(profileName) {
+    var base = profileBase(profileName);
+    var g = document.getElementById('statusGateway');
+    g.textContent = '\u23F3 Gateway';
+    fetch(base + 'v1/health', {cache:'no-store'}).then(function(r) {
+      g.textContent = r.ok ? '\u2705 Gateway' : '\uD83D\uDCA4 Gateway';
     }).catch(function() {
-      d.textContent = '\uD83D\uDCA4 Dashboard';
+      g.textContent = '\uD83D\uDCA4 Gateway';
     });
+
+    if (showDashboard) {
+      var d = document.getElementById('statusDashboard');
+      d.style.display = '';
+      d.textContent = '\u23F3 Dashboard';
+      fetch(base + 'dashboard/api/status', {cache:'no-store'}).then(function(r) {
+        d.textContent = r.ok ? '\u2705 Dashboard' : '\uD83D\uDCA4 Dashboard';
+      }).catch(function() {
+        d.textContent = '\uD83D\uDCA4 Dashboard';
+      });
+    }
   }
+
+  updateStatusChecks(initialProfile);
 })();
 </script>
 </body>

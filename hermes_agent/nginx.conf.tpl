@@ -17,6 +17,7 @@ http {
     log_format minimal '$remote_addr - $request_uri $status';
     access_log /dev/stdout minimal;
 
+    # ── Default profile upstreams ─────────────────────────────────────
     upstream ttyd_terminal {
         server 127.0.0.1:%%TTYD_TERMINAL_PORT%%;
     }
@@ -32,6 +33,9 @@ http {
     upstream hermes_dashboard {
         server 127.0.0.1:%%DASHBOARD_PORT%%;
     }
+
+    # ── Named-profile upstreams (generated per profile) ───────────────
+    %%PROFILE_UPSTREAMS%%
 
     # ── Ingress (HA sidebar — landing page) ──────────────────────────
     server {
@@ -111,6 +115,9 @@ http {
             proxy_send_timeout 300s;
         }
         # DASHBOARD_END
+
+        # ── Named-profile routes (generated per profile) ──────────────
+        %%PROFILE_LOCATIONS%%
 
         # CA certificate download
         location = /cert/ca.crt {

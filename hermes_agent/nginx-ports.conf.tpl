@@ -1,3 +1,6 @@
+    # ── Named-profile upstreams (generated per profile) ───────────────
+    %%PROFILE_UPSTREAMS%%
+
     # ── HTTP (direct LAN access) ─────────────────────────────────────
     server {
         listen %%HTTP_PORT%%;
@@ -102,6 +105,9 @@
             proxy_send_timeout 300s;
         }
         # DASHBOARD_END
+
+        # ── Named-profile routes (generated per profile) ──────────────
+        %%PROFILE_LOCATIONS%%
 
         location = /cert/ca.crt {
             %%AUTH_BASIC_OFF%%
@@ -233,6 +239,9 @@
             proxy_send_timeout 300s;
         }
         # DASHBOARD_END
+
+        # ── Named-profile routes (generated per profile) ──────────────
+        %%PROFILE_LOCATIONS%%
 
         location = /cert/ca.crt {
             %%AUTH_BASIC_OFF%%
