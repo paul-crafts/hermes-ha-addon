@@ -692,10 +692,10 @@ sed -i \
 echo "[run] Nginx config rendered"
 
 # ── Section 10: Start services ───────────────────────────────────────
-declare -A GATEWAY_PIDS
-declare -A TTYD_HERMES_PIDS
-declare -A TTYD_TERMINAL_PIDS
-declare -A DASHBOARD_PIDS
+# We use standard variables instead of associative arrays for maximum shell compatibility.
+# For each profile, we will have variables like PID_GATEWAY_default, PID_TTYD_H_default, etc.
+# We keep a list of profile names to loop through.
+PROFILES_LIST=""
 
 start_gateway() {
     local p_name="${1}"
@@ -705,9 +705,10 @@ start_gateway() {
     mkdir -p "$p_home/logs"
     (HERMES_HOME="$p_home" HERMES_CONFIG_OVERRIDE_api_server__port="$p_port" hermes gateway run 2>&1 | tee -a "$p_home/logs/gateway.log") &
     local tee_pid=$!
-    sleep 1.5
+    sleep 2
     local g_pid=$(pgrep -f "hermes.*gateway run" | sort -n | tail -1 || echo "$tee_pid")
-    GATEWAY_PIDS["$p_name"]="$g_pid"
+    eval "PID_GATEWAY_${p_name}=\"$g_pid\""
+    echo "[run] [$p_name] Gateway started (PID: $g_pid)"
 }
 
 start_ttyd() {
@@ -722,11 +723,11 @@ start_ttyd() {
     echo "[run] [$p_name] Starting ttyd..."
     ttyd --port "${p_h_port}" --interface 127.0.0.1 --base-path "$p_base" --writable -d 3 \
         tmux -u new -A -s "hermes_${p_name}" /usr/local/bin/start-hermes "$([ "$p_name" != "default" ] && echo "$p_name")" &
-    TTYD_HERMES_PIDS["$p_name"]=$!
+    eval "PID_TTYD_H_${p_name}=\"$!\""
     
     ttyd --port "${p_t_port}" --interface 127.0.0.1 --base-path "$t_base" --writable -d 3 \
         tmux -u new -A -s "terminal_${p_name}" /usr/bin/bash &
-    TTYD_TERMINAL_PIDS["$p_name"]=$!
+    eval "PID_TTYD_T_${p_name}=\"$!\""
 }
 
 start_dashboard() {
@@ -736,7 +737,7 @@ start_dashboard() {
     if [ "$DASHBOARD_AVAILABLE" != "true" ]; then return; fi
     echo "[run] [$p_name] Starting Dashboard (port: $p_port)..."
     (cd "$p_home" && HERMES_HOME="$p_home" python -c "from hermes_cli.web_server import start_server; start_server(host='127.0.0.1', port=$p_port, open_browser=False)") &
-    DASHBOARD_PIDS["$p_name"]=$!
+    eval "PID_DASHBOARD_${p_name}=\"$!\""
 }
 
 inject_dashboard_token() {
@@ -748,7 +749,10 @@ inject_dashboard_token() {
     local token=""
     for i in $(seq 1 15); do
         token=$(curl -s "http://127.0.0.1:${p_port}/" 2>/dev/null | grep "__HERMES_SESSION_TOKEN__=" | sed 's/.*__HERMES_SESSION_TOKEN__="\([^"]*\)".*/\1/' || true)
-        [ -n "$token" ] && break
+        if [ -n "$token" ]; then
+            echo "[run] [$p_name] Token found (${#token} chars)"
+            break
+        fi
         sleep 2
     done
     [ -z "$token" ] && echo "[run] [$p_name] Warning: token not found" && token="UNAVAILABLE"
@@ -767,9 +771,11 @@ trap shutdown SIGTERM SIGINT
 
 # Start all profiles
 echo "[run] Launching services for all profiles..."
+set -x  # Enable debug mode for the launch sequence
 for i in $(seq 0 $((PROFILES_COUNT - 1))); do
-    NAME=$(echo "$PROFILES_DATA" | jq -r ".[$i].name")
-    P_PATH=$(echo "$PROFILES_DATA" | jq -r ".[$i].path")
+    NAME=$(echo "$PROFILES_DATA" | jq -r ".[$i].name" | tr '-' '_') # tr to make it a valid shell var name
+    PATH_VAL=$(echo "$PROFILES_DATA" | jq -r ".[$i].path")
+    PROFILES_LIST="$PROFILES_LIST $NAME"
     
     if [ "$NAME" = "default" ]; then
         API=$GATEWAY_API_PORT; H_P=$TTYD_HERMES_PORT; T_P=$TTYD_TERMINAL_PORT; D_P=$DASHBOARD_PORT
@@ -777,11 +783,12 @@ for i in $(seq 0 $((PROFILES_COUNT - 1))); do
         API=$((GATEWAY_API_PORT + i * 10)); H_P=$((TTYD_HERMES_PORT + i * PORT_BLOCK)); T_P=$((TTYD_TERMINAL_PORT + i * PORT_BLOCK)); D_P=$((DASHBOARD_PORT + i * PORT_BLOCK))
     fi
     
-    start_gateway "$NAME" "$P_PATH" "$API"
+    start_gateway "$NAME" "$PATH_VAL" "$API"
     start_ttyd "$NAME" "$H_P" "$T_P"
-    start_dashboard "$NAME" "$P_PATH" "$D_P"
+    start_dashboard "$NAME" "$PATH_VAL" "$D_P"
     inject_dashboard_token "$NAME" "$D_P"
 done
+set +x
 
 # Final Nginx reload
 echo "[run] Reloading Nginx..."
@@ -798,11 +805,12 @@ echo "[run] All services started successfully"
 shutdown() {
     echo "[run] Stopping services..."
     nginx -s quit 2>/dev/null || true
-    for p in "${!GATEWAY_PIDS[@]}"; do
-        [ -n "${GATEWAY_PIDS[$p]}" ] && kill "${GATEWAY_PIDS[$p]}" 2>/dev/null || true
-        [ -n "${TTYD_HERMES_PIDS[$p]}" ] && kill "${TTYD_HERMES_PIDS[$p]}" 2>/dev/null || true
-        [ -n "${TTYD_TERMINAL_PIDS[$p]}" ] && kill "${TTYD_TERMINAL_PIDS[$p]}" 2>/dev/null || true
-        [ -n "${DASHBOARD_PIDS[$p]}" ] && kill "${DASHBOARD_PIDS[$p]}" 2>/dev/null || true
+    for p in $PROFILES_LIST; do
+        G_VAR="PID_GATEWAY_$p"; H_VAR="PID_TTYD_H_$p"; T_VAR="PID_TTYD_T_$p"; D_VAR="PID_DASHBOARD_$p"
+        [ -n "${!G_VAR}" ] && kill "${!G_VAR}" 2>/dev/null || true
+        [ -n "${!H_VAR}" ] && kill "${!H_VAR}" 2>/dev/null || true
+        [ -n "${!T_VAR}" ] && kill "${!T_VAR}" 2>/dev/null || true
+        [ -n "${!D_VAR}" ] && kill "${!D_VAR}" 2>/dev/null || true
     done
     echo "[run] Exiting."
     exit 0
@@ -810,17 +818,22 @@ shutdown() {
 
 # ── Section 12: Supervisor loop ──────────────────────────────────────
 while true; do
-    for p in "${!GATEWAY_PIDS[@]}"; do
-        if ! kill -0 "${GATEWAY_PIDS[$p]}" 2>/dev/null; then
+    for p in $PROFILES_LIST; do
+        G_VAR="PID_GATEWAY_$p"
+        G_PID="${!G_VAR}"
+        if [ -n "$G_PID" ] && ! kill -0 "$G_PID" 2>/dev/null; then
             echo "[run] [$p] Gateway crashed, restarting..."
             P_IDX=0
-            for i in $(seq 0 $((PROFILES_COUNT - 1))); do
-                [ "$(echo "$PROFILES_DATA" | jq -r ".[$i].name")" = "$p" ] && P_IDX=$i && break
+            # Find index
+            idx=0
+            for check in $(echo "$PROFILES_DATA" | jq -r '.[].name' | tr '-' '_'); do
+                [ "$check" = "$p" ] && P_IDX=$idx && break
+                idx=$((idx + 1))
             done
-            P_PATH=$(echo "$PROFILES_DATA" | jq -r ".[$P_IDX].path")
+            P_PATH_VAL=$(echo "$PROFILES_DATA" | jq -r ".[$P_IDX].path")
             P_API=$((GATEWAY_API_PORT + P_IDX * 10))
             [ "$p" = "default" ] && P_API=$GATEWAY_API_PORT
-            start_gateway "$p" "$P_PATH" "$P_API"
+            start_gateway "$p" "$P_PATH_VAL" "$P_API"
         fi
     done
     sleep 10
