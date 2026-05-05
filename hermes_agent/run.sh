@@ -805,7 +805,6 @@ trap shutdown SIGTERM SIGINT
 
 # Start all profiles
 echo "[run] Launching services for all profiles..."
-set -x  # Enable debug mode for the launch sequence
 for i in $(seq 0 $((PROFILES_COUNT - 1))); do
     NAME=$(echo "$PROFILES_DATA" | jq -r ".[$i].name" | tr '-' '_') # tr to make it a valid shell var name
     PATH_VAL=$(echo "$PROFILES_DATA" | jq -r ".[$i].path")
@@ -822,7 +821,6 @@ for i in $(seq 0 $((PROFILES_COUNT - 1))); do
     start_dashboard "$NAME" "$PATH_VAL" "$D_P"
     inject_dashboard_token "$NAME" "$D_P"
 done
-set +x
 
 # Final Nginx reload
 echo "[run] Reloading Nginx..."
