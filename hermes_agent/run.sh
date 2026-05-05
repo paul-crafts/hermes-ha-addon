@@ -636,14 +636,28 @@ if [ "$ENABLE_DASHBOARD" = "true" ] || [ "$ENABLE_TERMINAL" = "true" ] || [ "$EN
         -e "s|%%AUTH_BASIC_OFF%%|${AUTH_BASIC_OFF}|g" \
         /etc/nginx/ports.conf
     
-    # Inject upstreams and locations into ports.conf
-    [ -n "$PROFILE_UPSTREAMS" ] && sed -i "s|%%PROFILE_UPSTREAMS%%|$(echo "$PROFILE_UPSTREAMS" | sed 's/[&/|]/\\&/g')|g" /etc/nginx/ports.conf || sed -i "s|%%PROFILE_UPSTREAMS%%||g" /etc/nginx/ports.conf
-    [ -n "$PROFILE_LOCATIONS" ] && sed -i "s|%%PROFILE_LOCATIONS%%|$(echo "$PROFILE_LOCATIONS" | sed 's/[&/|]/\\&/g')|g" /etc/nginx/ports.conf || sed -i "s|%%PROFILE_LOCATIONS%%||g" /etc/nginx/ports.conf
+    if [ -n "$PROFILE_UPSTREAMS" ]; then
+        sed -i "s|%%PROFILE_UPSTREAMS%%|$(echo "$PROFILE_UPSTREAMS" | sed 's/[&/|]/\\&/g')|g" /etc/nginx/ports.conf
+    else
+        sed -i "s|%%PROFILE_UPSTREAMS%%||g" /etc/nginx/ports.conf
+    fi
+
+    if [ -n "$PROFILE_LOCATIONS" ]; then
+        sed -i "s|%%PROFILE_LOCATIONS%%|$(echo "$PROFILE_LOCATIONS" | sed 's/[&/|]/\\&/g')|g" /etc/nginx/ports.conf
+    else
+        sed -i "s|%%PROFILE_LOCATIONS%%||g" /etc/nginx/ports.conf
+    fi
 
     # Strip blocks
-    [ "$ENABLE_TERMINAL" != "true" ] && sed -i '/# TERMINAL_START/,/# TERMINAL_END/d' /etc/nginx/ports.conf
-    [ "$ENABLE_API" != "true" ] && sed -i '/# API_START/,/# API_END/d' /etc/nginx/ports.conf
-    [ "$ENABLE_DASHBOARD" != "true" ] || [ "$DASHBOARD_AVAILABLE" != "true" ] && sed -i '/# DASHBOARD_START/,/# DASHBOARD_END/d' /etc/nginx/ports.conf
+    if [ "$ENABLE_TERMINAL" != "true" ]; then
+        sed -i '/# TERMINAL_START/,/# TERMINAL_END/d' /etc/nginx/ports.conf
+    fi
+    if [ "$ENABLE_API" != "true" ]; then
+        sed -i '/# API_START/,/# API_END/d' /etc/nginx/ports.conf
+    fi
+    if [ "$ENABLE_DASHBOARD" != "true" ] || [ "$DASHBOARD_AVAILABLE" != "true" ]; then
+        sed -i '/# DASHBOARD_START/,/# DASHBOARD_END/d' /etc/nginx/ports.conf
+    fi
     
     INCLUDE_PORTS="include /etc/nginx/ports.conf;"
 else
@@ -663,8 +677,17 @@ sed -i \
     /etc/nginx/nginx.conf
 
 # Inject profile markers into main nginx config
-[ -n "$PROFILE_UPSTREAMS" ] && sed -i "s|%%PROFILE_UPSTREAMS%%|$(echo "$PROFILE_UPSTREAMS" | sed 's/[&/|]/\\&/g')|g" /etc/nginx/nginx.conf || sed -i "s|%%PROFILE_UPSTREAMS%%||g" /etc/nginx/nginx.conf
-[ -n "$PROFILE_LOCATIONS" ] && sed -i "s|%%PROFILE_LOCATIONS%%|$(echo "$PROFILE_LOCATIONS" | sed 's/[&/|]/\\&/g')|g" /etc/nginx/nginx.conf || sed -i "s|%%PROFILE_LOCATIONS%%||g" /etc/nginx/nginx.conf
+if [ -n "$PROFILE_UPSTREAMS" ]; then
+    sed -i "s|%%PROFILE_UPSTREAMS%%|$(echo "$PROFILE_UPSTREAMS" | sed 's/[&/|]/\\&/g')|g" /etc/nginx/nginx.conf
+else
+    sed -i "s|%%PROFILE_UPSTREAMS%%||g" /etc/nginx/nginx.conf
+fi
+
+if [ -n "$PROFILE_LOCATIONS" ]; then
+    sed -i "s|%%PROFILE_LOCATIONS%%|$(echo "$PROFILE_LOCATIONS" | sed 's/[&/|]/\\&/g')|g" /etc/nginx/nginx.conf
+else
+    sed -i "s|%%PROFILE_LOCATIONS%%||g" /etc/nginx/nginx.conf
+fi
 
 # Strip dashboard from ingress if module not available
 if [ "$DASHBOARD_AVAILABLE" != "true" ]; then
@@ -716,9 +739,13 @@ start_ttyd() {
     local p_h_port="${2}"
     local p_t_port="${3}"
     local p_base="/hermes/"
-    [ "$p_name" != "default" ] && p_base="/profiles/${p_name}/hermes/"
+    if [ "$p_name" != "default" ]; then
+        p_base="/profiles/${p_name}/hermes/"
+    fi
     local t_base="/terminal/"
-    [ "$p_name" != "default" ] && t_base="/profiles/${p_name}/terminal/"
+    if [ "$p_name" != "default" ]; then
+        t_base="/profiles/${p_name}/terminal/"
+    fi
 
     echo "[run] [$p_name] Starting ttyd..."
     ttyd --port "${p_h_port}" --interface 127.0.0.1 --base-path "$p_base" --writable -d 3 \
@@ -755,14 +782,21 @@ inject_dashboard_token() {
         fi
         sleep 2
     done
-    [ -z "$token" ] && echo "[run] [$p_name] Warning: token not found" && token="UNAVAILABLE"
+    if [ -z "$token" ]; then
+        echo "[run] [$p_name] Warning: token not found"
+        token="UNAVAILABLE"
+    fi
     
     if [ "$p_name" = "default" ]; then
         sed -i "s|%%DASHBOARD_TOKEN%%|${token}|g" /etc/nginx/nginx.conf
-        [ -f /etc/nginx/ports.conf ] && sed -i "s|%%DASHBOARD_TOKEN%%|${token}|g" /etc/nginx/ports.conf
+        if [ -f /etc/nginx/ports.conf ]; then
+            sed -i "s|%%DASHBOARD_TOKEN%%|${token}|g" /etc/nginx/ports.conf
+        fi
     else
         sed -i "s|%%DASHBOARD_TOKEN_${p_name}%%|${token}|g" /etc/nginx/nginx.conf
-        [ -f /etc/nginx/ports.conf ] && sed -i "s|%%DASHBOARD_TOKEN_${p_name}%%|${token}|g" /etc/nginx/ports.conf
+        if [ -f /etc/nginx/ports.conf ]; then
+            sed -i "s|%%DASHBOARD_TOKEN_${p_name}%%|${token}|g" /etc/nginx/ports.conf
+        fi
     fi
 }
 
