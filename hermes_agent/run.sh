@@ -636,17 +636,18 @@ if [ "$ENABLE_DASHBOARD" = "true" ] || [ "$ENABLE_TERMINAL" = "true" ] || [ "$EN
         -e "s|%%AUTH_BASIC_OFF%%|${AUTH_BASIC_OFF}|g" \
         /etc/nginx/ports.conf
     
+    # Inject upstreams and locations into ports.conf using temp files for safety with newlines
     if [ -n "$PROFILE_UPSTREAMS" ]; then
-        sed -i "s|%%PROFILE_UPSTREAMS%%|$(echo "$PROFILE_UPSTREAMS" | sed 's/[&/|]/\\&/g')|g" /etc/nginx/ports.conf
-    else
-        sed -i "s|%%PROFILE_UPSTREAMS%%||g" /etc/nginx/ports.conf
+        echo "$PROFILE_UPSTREAMS" > /tmp/upstreams.conf
+        sed -i '/%%PROFILE_UPSTREAMS%%/r /tmp/upstreams.conf' /etc/nginx/ports.conf
     fi
+    sed -i "s|%%PROFILE_UPSTREAMS%%||g" /etc/nginx/ports.conf
 
     if [ -n "$PROFILE_LOCATIONS" ]; then
-        sed -i "s|%%PROFILE_LOCATIONS%%|$(echo "$PROFILE_LOCATIONS" | sed 's/[&/|]/\\&/g')|g" /etc/nginx/ports.conf
-    else
-        sed -i "s|%%PROFILE_LOCATIONS%%||g" /etc/nginx/ports.conf
+        echo "$PROFILE_LOCATIONS" > /tmp/locations.conf
+        sed -i '/%%PROFILE_LOCATIONS%%/r /tmp/locations.conf' /etc/nginx/ports.conf
     fi
+    sed -i "s|%%PROFILE_LOCATIONS%%||g" /etc/nginx/ports.conf
 
     # Strip blocks
     if [ "$ENABLE_TERMINAL" != "true" ]; then
@@ -678,16 +679,16 @@ sed -i \
 
 # Inject profile markers into main nginx config
 if [ -n "$PROFILE_UPSTREAMS" ]; then
-    sed -i "s|%%PROFILE_UPSTREAMS%%|$(echo "$PROFILE_UPSTREAMS" | sed 's/[&/|]/\\&/g')|g" /etc/nginx/nginx.conf
-else
-    sed -i "s|%%PROFILE_UPSTREAMS%%||g" /etc/nginx/nginx.conf
+    echo "$PROFILE_UPSTREAMS" > /tmp/upstreams.conf
+    sed -i '/%%PROFILE_UPSTREAMS%%/r /tmp/upstreams.conf' /etc/nginx/nginx.conf
 fi
+sed -i "s|%%PROFILE_UPSTREAMS%%||g" /etc/nginx/nginx.conf
 
 if [ -n "$PROFILE_LOCATIONS" ]; then
-    sed -i "s|%%PROFILE_LOCATIONS%%|$(echo "$PROFILE_LOCATIONS" | sed 's/[&/|]/\\&/g')|g" /etc/nginx/nginx.conf
-else
-    sed -i "s|%%PROFILE_LOCATIONS%%||g" /etc/nginx/nginx.conf
+    echo "$PROFILE_LOCATIONS" > /tmp/locations.conf
+    sed -i '/%%PROFILE_LOCATIONS%%/r /tmp/locations.conf' /etc/nginx/nginx.conf
 fi
+sed -i "s|%%PROFILE_LOCATIONS%%||g" /etc/nginx/nginx.conf
 
 # Strip dashboard from ingress if module not available
 if [ "$DASHBOARD_AVAILABLE" != "true" ]; then
