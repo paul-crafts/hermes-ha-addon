@@ -2,7 +2,7 @@ name: Hermes Agent
 version: "1.0.4"
 slug: hermes_agent
 description: "The self-improving AI agent built by Nous Research. Home Assistant add-on by Wolfram Ravenwolf."
-url: "https://github.com/WolframRavenwolf/hermes-ha-addon"
+url: "https://github.com/paul-crafts/hermes-ha-addon"
 arch:
   - amd64
   - aarch64
