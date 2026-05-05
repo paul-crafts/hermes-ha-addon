@@ -769,7 +769,7 @@ trap shutdown SIGTERM SIGINT
 echo "[run] Launching services for all profiles..."
 for i in $(seq 0 $((PROFILES_COUNT - 1))); do
     NAME=$(echo "$PROFILES_DATA" | jq -r ".[$i].name")
-    PATH=$(echo "$PROFILES_DATA" | jq -r ".[$i].path")
+    P_PATH=$(echo "$PROFILES_DATA" | jq -r ".[$i].path")
     
     if [ "$NAME" = "default" ]; then
         API=$GATEWAY_API_PORT; H_P=$TTYD_HERMES_PORT; T_P=$TTYD_TERMINAL_PORT; D_P=$DASHBOARD_PORT
@@ -777,9 +777,9 @@ for i in $(seq 0 $((PROFILES_COUNT - 1))); do
         API=$((GATEWAY_API_PORT + i * 10)); H_P=$((TTYD_HERMES_PORT + i * PORT_BLOCK)); T_P=$((TTYD_TERMINAL_PORT + i * PORT_BLOCK)); D_P=$((DASHBOARD_PORT + i * PORT_BLOCK))
     fi
     
-    start_gateway "$NAME" "$PATH" "$API"
+    start_gateway "$NAME" "$P_PATH" "$API"
     start_ttyd "$NAME" "$H_P" "$T_P"
-    start_dashboard "$NAME" "$PATH" "$D_P"
+    start_dashboard "$NAME" "$P_PATH" "$D_P"
     inject_dashboard_token "$NAME" "$D_P"
 done
 
