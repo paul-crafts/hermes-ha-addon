@@ -37,6 +37,16 @@ http {
     # ── Named-profile upstreams (generated per profile) ───────────────
     %%PROFILE_UPSTREAMS%%
 
+    # ── Map profile to token ──────────────────────────────────────────
+    map $request_uri $profile_from_uri {
+        ~^/profiles/([^/]+)/  $1;
+        default               "default";
+    }
+
+    map $profile_from_uri $dashboard_token {
+        include /tmp/dashboard_tokens.conf;
+    }
+
     # ── Ingress (HA sidebar — landing page) ──────────────────────────
     server {
         listen %%INGRESS_PORT%%;
@@ -46,6 +56,12 @@ http {
             root /var/www;
             try_files /landing.html =404;
             add_header Cache-Control "no-cache";
+        }
+
+        # Manager endpoint
+        location /manage {
+            proxy_pass http://127.0.0.1:49999;
+            proxy_set_header Host $host;
         }
 
         # Hermes Agent (login shell → exec hermes)
@@ -97,7 +113,7 @@ http {
             proxy_set_header Host 127.0.0.1;
             proxy_set_header X-Forwarded-Host $host;
             proxy_set_header X-Real-IP $remote_addr;
-            proxy_set_header Authorization "Bearer %%DASHBOARD_TOKEN%%";
+            proxy_set_header Authorization "Bearer $dashboard_token";
             proxy_buffering off;
             proxy_read_timeout 300s;
             proxy_send_timeout 300s;

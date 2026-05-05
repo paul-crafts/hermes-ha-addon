@@ -110,7 +110,7 @@
   var btnHermes     = document.getElementById('btnHermes');
   var btnDashboard  = document.getElementById('btnDashboard');
   var btnTerminal   = document.getElementById('btnTerminal');
-  var current = 'hermes';
+  var current = null;
   var dashboardLoaded = false;
 
   var showDashboard = %%SHOW_DASHBOARD%%;
@@ -118,59 +118,67 @@
     btnDashboard.style.display = '';
   }
 
-  // Load iframe sources for a profile; reload if profile changed
-  function loadProfileSources(profileName, force) {
-    var base = profileBase(profileName);
-    var newHermes   = base + 'hermes/';
-    var newTerminal = base + 'terminal/';
-    if (force || frameHermes.src !== newHermes) {
-      frameHermes.src = newHermes;
-    }
-    if (force || frameTerminal.src !== newTerminal) {
-      frameTerminal.src = newTerminal;
-    }
-    // Dashboard is lazy-loaded; reset so it reloads next time user switches to it
-    if (force) {
-      frameDashboard.src = '';
-      dashboardLoaded = false;
+  function showLoading(show) {
+    var g = document.getElementById('statusGateway');
+    if (show) {
+      g.innerHTML = '<span class="version">Starting service...</span>';
+    } else {
+      updateStatusChecks(sel.value);
     }
   }
 
-  // Initial load
-  loadProfileSources(initialProfile, false);
+  window.setMode = function(mode) {
+    if (mode === current) return;
+    var profileName = sel.value || 'default';
+    var base = profileBase(profileName);
+    
+    // Determine service type for manager
+    var serviceType = '';
+    if (mode === 'hermes') serviceType = 'ttyd_h';
+    else if (mode === 'terminal') serviceType = 'ttyd_t';
+    else if (mode === 'dashboard') serviceType = 'dashboard';
+
+    if (serviceType) {
+      showLoading(true);
+      fetch('./manage?profile=' + profileName + '&service=' + serviceType)
+        .then(function(r) { return r.json(); })
+        .then(function(data) {
+          showLoading(false);
+          if (data.success) {
+            current = mode;
+            frameHermes.className = mode === 'hermes' ? '' : 'hidden';
+            frameDashboard.className = mode === 'dashboard' ? '' : 'hidden';
+            frameTerminal.className = mode === 'terminal' ? '' : 'hidden';
+            btnHermes.className = mode === 'hermes' ? 'btn active' : 'btn secondary';
+            btnDashboard.className = mode === 'dashboard' ? 'btn active' : 'btn secondary';
+            btnTerminal.className = mode === 'terminal' ? 'btn active' : 'btn secondary';
+
+            var targetSrc = '';
+            if (mode === 'hermes') targetSrc = base + 'hermes/';
+            else if (mode === 'terminal') targetSrc = base + 'terminal/';
+            else if (mode === 'dashboard') targetSrc = base + 'dashboard/';
+
+            var frame = mode === 'hermes' ? frameHermes : (mode === 'terminal' ? frameTerminal : frameDashboard);
+            if (frame.src.indexOf(targetSrc) === -1 || frame.src === '' || mode === 'dashboard') {
+              frame.src = targetSrc;
+            }
+          }
+        })
+        .catch(function(e) {
+          showLoading(false);
+          console.error("Manager error", e);
+        });
+    }
+  };
 
   // Profile dropdown change handler
   sel.addEventListener('change', function() {
     var name = sel.value;
     localStorage.setItem('hermes_profile', name);
     // Reset to hermes mode on profile switch
-    current = 'hermes';
-    frameHermes.className = '';
-    frameDashboard.className = 'hidden';
-    frameTerminal.className = 'hidden';
-    btnHermes.className = 'btn active';
-    if (showDashboard) btnDashboard.className = 'btn secondary';
-    btnTerminal.className = 'btn secondary';
-    loadProfileSources(name, true);
-    updateStatusChecks(name);
+    current = null; // force reload
+    setMode('hermes');
   });
-
-  window.setMode = function(mode) {
-    if (mode === current) return;
-    current = mode;
-    var profileName = sel.value || 'default';
-    var base = profileBase(profileName);
-    frameHermes.className = mode === 'hermes' ? '' : 'hidden';
-    frameDashboard.className = mode === 'dashboard' ? '' : 'hidden';
-    frameTerminal.className = mode === 'terminal' ? '' : 'hidden';
-    btnHermes.className = mode === 'hermes' ? 'btn active' : 'btn secondary';
-    btnDashboard.className = mode === 'dashboard' ? 'btn active' : 'btn secondary';
-    btnTerminal.className = mode === 'terminal' ? 'btn active' : 'btn secondary';
-    if (mode === 'dashboard' && !dashboardLoaded) {
-      frameDashboard.src = base + 'dashboard/';
-      dashboardLoaded = true;
-    }
-  };
 
   // ── Detect context: iframe = HA ingress, top-level = direct port access ───
   try { var inIframe = window !== window.top; } catch(e) { var inIframe = true; }
@@ -222,7 +230,8 @@
     }
   }
 
-  updateStatusChecks(initialProfile);
+  // Initial mode set
+  setMode('hermes');
 })();
 </script>
 </body>
